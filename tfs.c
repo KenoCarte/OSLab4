@@ -18,10 +18,7 @@
 char diskfile_path[PATH_MAX];
 
 // Declare your in-memory data structures here
-const int inode_bitmap_idx = 1;
-const int data_bitmap_idx = 2;
-const int inode_region_idx = 3;
-const int data_region_idx = 3 + ((MAX_INUM * sizeof(struct inode) + BLOCK_SIZE - 1) / BLOCK_SIZE);
+struct superblock sb;
 
 /*
  * Get available inode number from bitmap
@@ -33,16 +30,16 @@ int get_avail_ino() {
 		perror("malloc failed");
 		exit(EXIT_FAILURE);
 	}
-	if (bio_read(inode_bitmap_idx, inode_bitmap) == -1) {
+	if (bio_read(sb.i_bitmap_blk, inode_bitmap) == -1) {
 		perror("bio_read failed");
 		exit(EXIT_FAILURE);
 	}
 	// Step 2: Traverse inode bitmap to find an available slot
 	for (int i = 0; i < MAX_INUM; i++) {
 		if (get_bitmap(inode_bitmap, i) == 0) {
-			// Step 3: Update inode bitmap and write to disk 
+			// Step 3: Update inode bitmap and write to disk
 			set_bitmap(inode_bitmap, i);
-			bio_write(inode_bitmap_idx, inode_bitmap);
+			bio_write(sb.i_bitmap_blk, inode_bitmap);
 			free(inode_bitmap);
 			return i;
 		}
@@ -61,16 +58,16 @@ int get_avail_blkno() {
 		perror("malloc failed");
 		exit(EXIT_FAILURE);
 	}
-	if (bio_read(data_bitmap_idx, data_bitmap) == -1) {
+	if (bio_read(sb.d_bitmap_blk, data_bitmap) == -1) {
 		perror("bio_read failed");
 		exit(EXIT_FAILURE);
 	}
 	// Step 2: Traverse data block bitmap to find an available slot
 	for (int i = 0; i < MAX_DNUM; i++) {
 		if (get_bitmap(data_bitmap, i) == 0) {
-			// Step 3: Update data block bitmap and write to disk 
+			// Step 3: Update data block bitmap and write to disk
 			set_bitmap(data_bitmap, i);
-			bio_write(data_bitmap_idx, data_bitmap);
+			bio_write(sb.d_bitmap_blk, data_bitmap);
 			free(data_bitmap);
 			return i;
 		}
@@ -84,9 +81,10 @@ int get_avail_blkno() {
  */
 int readi(uint16_t ino, struct inode* inode) {
 	// Step 1: Get the inode's on-disk block number
-	int block_idx = inode_region_idx + (ino * sizeof(struct inode) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+	int offset = ino * sizeof(struct inode);
+	int block_idx = sb.i_start_blk + offset / BLOCK_SIZE;
 	// Step 2: Get offset of the inode in the inode on-disk block
-	int offset = (ino * sizeof(struct inode)) % BLOCK_SIZE;
+	int inblock_offset = offset % BLOCK_SIZE;
 	// Step 3: Read the block from disk and then copy into inode structure
 	char* block = malloc(BLOCK_SIZE);
 	if (!block) {
@@ -97,17 +95,18 @@ int readi(uint16_t ino, struct inode* inode) {
 		perror("bio_read failed");
 		exit(EXIT_FAILURE);
 	}
-	memcpy(inode, block + offset, sizeof(struct inode));
+	memcpy(inode, block + inblock_offset, sizeof(struct inode));
 	free(block);
 	return 0;
 }
 
 int writei(uint16_t ino, struct inode* inode) {
 	// Step 1: Get the block number where this inode resides on disk
-	int block_idx = inode_region_idx + (ino * sizeof(struct inode) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+	int offset = ino * sizeof(struct inode);
+	int block_idx = sb.i_start_blk + offset / BLOCK_SIZE;
 	// Step 2: Get the offset in the block where this inode resides on disk
-	int offset = (ino * sizeof(struct inode)) % BLOCK_SIZE;
-	// Step 3: Write inode to disk 
+	int inblock_offset = offset % BLOCK_SIZE;
+	// Step 3: Write inode to disk
 	char* block = malloc(BLOCK_SIZE);
 	if (!block) {
 		perror("malloc failed");
@@ -117,11 +116,12 @@ int writei(uint16_t ino, struct inode* inode) {
 		perror("bio_read failed");
 		exit(EXIT_FAILURE);
 	}
-	memcpy(block + offset, inode, sizeof(struct inode));
+	memcpy(block + inblock_offset, inode, sizeof(struct inode));
 	if (bio_write(block_idx, block) == -1) {
 		perror("bio_write failed");
 		exit(EXIT_FAILURE);
 	}
+	free(block);
 	return 0;
 }
 
@@ -130,15 +130,37 @@ int writei(uint16_t ino, struct inode* inode) {
  * directory operations
  */
 int dir_find(uint16_t ino, const char* fname, size_t name_len, struct dirent* dirent) {
-
 	// Step 1: Call readi() to get the inode using ino (inode number of current directory)
-
-	// Step 2: Get data block of current directory from inode
-
-	// Step 3: Read directory's data block and check each directory entry.
-	//If the name matches, then copy directory entry to dirent structure
-
-	return 0;
+	struct inode dir_inode;
+	if (readi(ino, &dir_inode) == -1) {
+		perror("readi failed");
+		exit(EXIT_FAILURE);
+	}
+	for (int i = 0; i < 16; i++) {
+		if (dir_inode.direct_ptr[i] == 0) continue;
+		char* block = malloc(BLOCK_SIZE);
+		if (!block) {
+			perror("malloc failed");
+			exit(EXIT_FAILURE);
+		}
+		// Step 2: Get data block of current directory from inode
+		if (bio_read(sb.d_start_blk + dir_inode.direct_ptr[i], block) == -1) {
+			perror("bio_read failed");
+			exit(EXIT_FAILURE);
+		}
+		// Step 3: Read directory's data block and check each directory entry.
+		//If the name matches, then copy directory entry to dirent structure
+		struct dirent* entries = (struct dirent*)block;
+		for (int j = 0; j < BLOCK_SIZE / sizeof(struct dirent); j++) {
+			if (entries[j].valid && strncmp(entries[j].name, fname, name_len) == 0) {
+				memcpy(dirent, &entries[j], sizeof(struct dirent));
+				free(block);
+				return 0;
+			}
+		}
+		free(block);
+	}
+	return -1;
 }
 
 int dir_add(struct inode dir_inode, uint16_t f_ino, const char* fname, size_t name_len) {
@@ -184,19 +206,30 @@ int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
  * Make file system
  */
 int tfs_mkfs() {
-
 	// Call dev_init() to initialize (Create) Diskfile
 	dev_init(diskfile_path);
 	// write superblock information
-
+	struct superblock init_sb;
+	memset(&init_sb, 0, sizeof(init_sb));
+	init_sb.magic_num = MAGIC_NUM;
+	init_sb.max_inum = MAX_INUM;
+	init_sb.max_dnum = MAX_DNUM;
+	init_sb.i_bitmap_blk = 1;
+	init_sb.d_bitmap_blk = 2;
+	init_sb.i_start_blk = 3;
+	init_sb.d_start_blk = 3 + (MAX_INUM * sizeof(struct inode) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+	char block[BLOCK_SIZE];
+	memset(block, 0, BLOCK_SIZE);
+	memcpy(block, &init_sb, sizeof(struct superblock));
+	bio_write(0, block);
 	// initialize inode bitmap
-
+	memset(block, 0, BLOCK_SIZE);
+	bio_write(init_sb.i_bitmap_blk, block);
 	// initialize data block bitmap
-
+	memset(block, 0, BLOCK_SIZE);
+	bio_write(init_sb.d_bitmap_blk, block);
 	// update bitmap information for root directory
-
 	// update inode for root directory
-
 	return 0;
 }
 
@@ -210,7 +243,11 @@ static void* tfs_init(struct fuse_conn_info* conn) {
 	if (access(diskfile_path, F_OK) == -1) tfs_mkfs();
 	dev_open(diskfile_path);
 	// Step 1b: If disk file is found, just initialize in-memory data structures
-  // and read superblock from disk
+	// and read superblock from disk
+	if (bio_read(0, &sb) <= 0) {
+		fprintf(stderr, "Failed to read superblock\n");
+		exit(EXIT_FAILURE);
+	}
 
 	return NULL;
 }
