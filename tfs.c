@@ -142,6 +142,84 @@ int writei(uint16_t ino, struct inode* inode) {
 	free(block);
 	return 0;
 }
+/*
+ * get_data_block: resolve logical block number -> absolute disk block number
+ *   alloc=0: just lookup, return 0 if not allocated
+ *   alloc=1: allocate blocks as needed, return -1 on failure
+ */
+#define INDIRECT_PER_BLOCK (BLOCK_SIZE / sizeof(int))  /* 1024 */
+
+int get_data_block(struct inode *inode, int logical_blkno, int alloc) {
+	/* direct blocks [0, 15] */
+	if (logical_blkno < 16) {
+		if (alloc && inode->direct_ptr[logical_blkno] == 0) {
+			int blk = get_avail_blkno();
+			if (blk == -1) return -1;
+			inode->direct_ptr[logical_blkno] = blk;
+			inode->size += BLOCK_SIZE;
+		}
+		return inode->direct_ptr[logical_blkno];
+	}
+	/* indirect blocks [16, 16+8*1024-1] */
+	logical_blkno -= 16;
+	int idx = logical_blkno / INDIRECT_PER_BLOCK;
+	int off = logical_blkno % INDIRECT_PER_BLOCK;
+	if (idx >= 8) return -1;  /* exceeds 8 indirect pointers */
+	/* allocate indirect block if needed */
+	if (alloc && inode->indirect_ptr[idx] == 0) {
+		int blk = get_avail_blkno();
+		if (blk == -1) return -1;
+		inode->indirect_ptr[idx] = blk;
+		/* zero-initialize the indirect block */
+		char zero[BLOCK_SIZE];
+		memset(zero, 0, BLOCK_SIZE);
+		bio_write(sb.d_start_blk + blk, zero);
+	}
+	int indirect_blk = inode->indirect_ptr[idx];
+	if (indirect_blk == 0) return 0;  /* not allocated */
+	/* read the indirect block to get the real data block number */
+	int table[INDIRECT_PER_BLOCK];
+	if (bio_read(sb.d_start_blk + indirect_blk, (char *)table) <= 0) {
+		perror("bio_read indirect block failed");
+		return -1;
+	}
+	if (alloc && table[off] == 0) {
+		table[off] = get_avail_blkno();
+		if (table[off] == -1) return -1;
+		bio_write(sb.d_start_blk + indirect_blk, (char *)table);
+		inode->size += BLOCK_SIZE;
+	}
+	return table[off];
+}
+
+/* Free all data blocks (direct + indirect) of an inode */
+void free_data_blocks(struct inode *inode) {
+	int blkno;
+	bitmap_t d_bitmap = malloc(BLOCK_SIZE);
+	if (!d_bitmap) return;
+	if (bio_read(sb.d_bitmap_blk, d_bitmap) <= 0) { free(d_bitmap); return; }
+	/* free direct blocks */
+	for (int i = 0; i < 16; i++) {
+		blkno = inode->direct_ptr[i];
+		if (blkno) { unset_bitmap(d_bitmap, blkno); inode->direct_ptr[i] = 0; }
+	}
+	/* free indirect blocks and their data blocks */
+	for (int i = 0; i < 8; i++) {
+		int ib = inode->indirect_ptr[i];
+		if (ib == 0) continue;
+		int table[INDIRECT_PER_BLOCK];
+		if (bio_read(sb.d_start_blk + ib, (char *)table) > 0) {
+			for (int j = 0; j < INDIRECT_PER_BLOCK; j++) {
+				blkno = table[j];
+				if (blkno) unset_bitmap(d_bitmap, blkno);
+			}
+		}
+		unset_bitmap(d_bitmap, ib);
+		inode->indirect_ptr[i] = 0;
+	}
+	bio_write(sb.d_bitmap_blk, d_bitmap);
+	free(d_bitmap);
+}
 
 
 /*
@@ -593,18 +671,7 @@ static int tfs_rmdir(const char* path) {
 		return -ENOENT;
 	}
 	// Step 4: Free data blocks of target directory
-	for (int i = 0; i < 16; i++) {
-		if (dir_inode.direct_ptr[i] == 0) continue;
-		int blkno = dir_inode.direct_ptr[i];
-		bitmap_t d_bitmap = malloc(BLOCK_SIZE);
-		if (d_bitmap) {
-			if (bio_read(sb.d_bitmap_blk, d_bitmap) > 0) {
-				unset_bitmap(d_bitmap, blkno);
-				bio_write(sb.d_bitmap_blk, d_bitmap);
-			}
-			free(d_bitmap);
-		}
-	}
+	free_data_blocks(&dir_inode);
 	// Step 5: Clear inode bitmap
 	bitmap_t inode_bitmap = malloc(BLOCK_SIZE);
 	if (inode_bitmap) {
@@ -708,10 +775,10 @@ static int tfs_read(const char* path, char* buffer, size_t size, off_t offset, s
 	int block_idx = offset / BLOCK_SIZE;
 	int block_offset = offset % BLOCK_SIZE;
 	while (bytes_read < bytes_to_read) {
-		if (block_idx >= 16) break;
-		if (node.direct_ptr[block_idx] == 0) break;
+		int abs_blk = get_data_block(&node, block_idx, 0);
+		if (abs_blk <= 0) break;
 		char block[BLOCK_SIZE];
-		if (bio_read(sb.d_start_blk + node.direct_ptr[block_idx], block) == -1) {
+		if (bio_read(sb.d_start_blk + abs_blk, block) == -1) {
 			perror("bio_read failed");
 			return -EIO;
 		}
@@ -735,24 +802,20 @@ static int tfs_write(const char* path, const char* buffer, size_t size, off_t of
 	int block_idx = offset / BLOCK_SIZE;
 	int block_offset = offset % BLOCK_SIZE;
 	while (bytes_written < size) {
-		if (block_idx >= 16) break;
-		if (node.direct_ptr[block_idx] == 0) {
-			int new_blk = get_avail_blkno();
-			if (new_blk == -1) {
-				perror("No available data block");
-				return -ENOSPC;
-			}
-			node.direct_ptr[block_idx] = new_blk;
+		int abs_blk = get_data_block(&node, block_idx, 1);
+		if (abs_blk == -1) {
+			perror("No available data block");
+			return -ENOSPC;
 		}
 		char block[BLOCK_SIZE];
-		if (bio_read(sb.d_start_blk + node.direct_ptr[block_idx], block) == -1) {
+		if (bio_read(sb.d_start_blk + abs_blk, block) == -1) {
 			perror("bio_read failed");
 			return -EIO;
 		}
 		// Step 3: Write the correct amount of data from offset to disk
 		size_t to_copy = (size - bytes_written < BLOCK_SIZE - block_offset) ? (size - bytes_written) : (BLOCK_SIZE - block_offset);
 		memcpy(block + block_offset, buffer + bytes_written, to_copy);
-		if (bio_write(sb.d_start_blk + node.direct_ptr[block_idx], block) == -1) {
+		if (bio_write(sb.d_start_blk + abs_blk, block) == -1) {
 			perror("bio_write failed");
 			return -EIO;
 		}
@@ -779,18 +842,7 @@ static int tfs_unlink(const char* path) {
 		return -ENOENT;
 	}
 	// Step 3: Clear data block bitmap of target file
-	for (int i = 0; i < 16; i++) {
-		if (target_inode.direct_ptr[i] == 0) continue;
-		int blkno = target_inode.direct_ptr[i];
-		bitmap_t d_bitmap = malloc(BLOCK_SIZE);
-		if (d_bitmap) {
-			if (bio_read(sb.d_bitmap_blk, d_bitmap) > 0) {
-				unset_bitmap(d_bitmap, blkno);
-				bio_write(sb.d_bitmap_blk, d_bitmap);
-			}
-			free(d_bitmap);
-		}
-	}
+	free_data_blocks(&target_inode);
 	// Step 4: Clear inode bitmap and its data block
 	bitmap_t inode_bitmap = malloc(BLOCK_SIZE);
 	if (!inode_bitmap) {
